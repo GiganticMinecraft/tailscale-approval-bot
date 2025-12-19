@@ -128,7 +128,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	// Get pending devices (authorized but no tags)
+	// Get pending devices
 	mux.HandleFunc("GET /pending-devices", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("Getting pending devices")
 		pending, err := getPendingDevices(r.Context(), client)
@@ -142,7 +142,7 @@ func main() {
 		json.NewEncoder(w).Encode(PendingDevicesResponse{PendingDevices: pending})
 	})
 
-	// Approve a device (apply tags)
+	// Approve a device
 	mux.HandleFunc("POST /approve/{deviceID}", func(w http.ResponseWriter, r *http.Request) {
 		deviceID := r.PathValue("deviceID")
 		slog.Info("Approve requested", "deviceID", deviceID)
@@ -160,7 +160,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	// Decline a device (just log, no action)
+	// Decline a device
 	mux.HandleFunc("POST /decline/{deviceID}", func(w http.ResponseWriter, r *http.Request) {
 		deviceID := r.PathValue("deviceID")
 		slog.Info("Device declined", "deviceID", deviceID)
@@ -170,7 +170,7 @@ func main() {
 
 	server := &http.Server{Addr: ":" + cfg.HTTPPort, Handler: mux}
 
-	slog.Info("Starting Tailscale tag controller",
+	slog.Info("Starting API server",
 		"tailnet", cfg.Tailnet,
 		"tags", cfg.TagsToApply,
 		"port", cfg.HTTPPort,
