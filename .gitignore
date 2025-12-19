@@ -1,0 +1,20 @@
+controller
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Environment variables
+.env
+.env.*
+
+# Coverage
+coverage.out
+*.coverprofile
+
+# IDE
+.idea/
+.vscode/
