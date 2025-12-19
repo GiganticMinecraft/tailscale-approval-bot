@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -11,48 +12,30 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	tsclient "github.com/tailscale/tailscale-client-go/v2"
 )
 
-var (
-	devicesProcessed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "tailscale_tag_controller_devices_processed_total",
-		Help: "Total number of devices processed",
-	})
-	tagsApplied = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "tailscale_tag_controller_tags_applied_total",
-		Help: "Total number of devices that had tags applied",
-	})
-	reconcileErrors = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "tailscale_tag_controller_reconcile_errors_total",
-		Help: "Total number of reconciliation errors",
-	})
-	reconcileDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "tailscale_tag_controller_reconcile_duration_seconds",
-		Help:    "Duration of reconciliation loops",
-		Buckets: prometheus.DefBuckets,
-	})
-)
-
-func init() {
-	prometheus.MustRegister(devicesProcessed, tagsApplied, reconcileErrors, reconcileDuration)
-}
-
 type Config struct {
-	Tailnet      string
-	APIKey       string
-	TagsToApply  []string
-	PollInterval time.Duration
-	HTTPPort     string
+	Tailnet     string
+	APIKey      string
+	TagsToApply []string
+	HTTPPort    string
 }
 
 type Device struct {
-	ID         string
-	Name       string
-	Authorized bool
-	Tags       []string
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Authorized bool     `json:"authorized"`
+	Tags       []string `json:"tags"`
+}
+
+type PendingDevice struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type PendingDevicesResponse struct {
+	PendingDevices []PendingDevice `json:"pending_devices"`
 }
 
 type DevicesClient interface {
@@ -107,28 +90,16 @@ func loadConfig() (Config, error) {
 		}
 	}
 
-	pollIntervalStr := os.Getenv("POLL_INTERVAL")
-	pollInterval := 30 * time.Second
-	if pollIntervalStr != "" {
-		d, err := time.ParseDuration(pollIntervalStr)
-		if err != nil {
-			slog.Warn("Invalid POLL_INTERVAL, using default", "default", pollInterval, "error", err)
-		} else {
-			pollInterval = d
-		}
-	}
-
 	httpPort := os.Getenv("HTTP_PORT")
 	if httpPort == "" {
 		httpPort = "8080"
 	}
 
 	return Config{
-		Tailnet:      tailnet,
-		APIKey:       apiKey,
-		TagsToApply:  tagsToApply,
-		PollInterval: pollInterval,
-		HTTPPort:     httpPort,
+		Tailnet:     tailnet,
+		APIKey:      apiKey,
+		TagsToApply: tagsToApply,
+		HTTPPort:    httpPort,
 	}, nil
 }
 
@@ -151,64 +122,81 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Start metrics and health server
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
-	mux.Handle("/metrics", promhttp.Handler())
+
+	// Get pending devices (authorized but no tags)
+	mux.HandleFunc("GET /pending-devices", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Getting pending devices")
+		pending, err := getPendingDevices(r.Context(), client)
+		if err != nil {
+			slog.Error("Failed to get pending devices", "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(PendingDevicesResponse{PendingDevices: pending})
+	})
+
+	// Approve a device (apply tags)
+	mux.HandleFunc("POST /approve/{deviceID}", func(w http.ResponseWriter, r *http.Request) {
+		deviceID := r.PathValue("deviceID")
+		slog.Info("Approve requested", "deviceID", deviceID)
+
+		_, err := withRetry(r.Context(), func() (struct{}, error) {
+			return struct{}{}, client.SetTags(r.Context(), deviceID, cfg.TagsToApply)
+		})
+		if err != nil {
+			slog.Error("Failed to set tags", "deviceID", deviceID, "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		slog.Info("Approved device", "deviceID", deviceID, "tags", cfg.TagsToApply)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	// Decline a device (just log, no action)
+	mux.HandleFunc("POST /decline/{deviceID}", func(w http.ResponseWriter, r *http.Request) {
+		deviceID := r.PathValue("deviceID")
+		slog.Info("Device declined", "deviceID", deviceID)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
 
 	server := &http.Server{Addr: ":" + cfg.HTTPPort, Handler: mux}
-	go func() {
-		slog.Info("Starting HTTP server", "port", cfg.HTTPPort)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("Metrics server error", "error", err)
-		}
-	}()
 
 	slog.Info("Starting Tailscale tag controller",
 		"tailnet", cfg.Tailnet,
 		"tags", cfg.TagsToApply,
-		"pollInterval", cfg.PollInterval,
+		"port", cfg.HTTPPort,
 	)
 
-	ticker := time.NewTicker(cfg.PollInterval)
-	defer ticker.Stop()
-
-	// Run immediately on start
-	reconcile(ctx, client, cfg.TagsToApply)
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("Shutting down")
-			server.Shutdown(context.Background())
-			return
-		case <-ticker.C:
-			reconcile(ctx, client, cfg.TagsToApply)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("HTTP server error", "error", err)
 		}
-	}
-}
-
-func reconcile(ctx context.Context, client DevicesClient, tagsToApply []string) {
-	start := time.Now()
-	defer func() {
-		reconcileDuration.Observe(time.Since(start).Seconds())
 	}()
 
+	<-ctx.Done()
+	slog.Info("Shutting down")
+	server.Shutdown(context.Background())
+}
+
+func getPendingDevices(ctx context.Context, client DevicesClient) ([]PendingDevice, error) {
 	devices, err := withRetry(ctx, func() ([]Device, error) {
 		return client.List(ctx)
 	})
 	if err != nil {
-		slog.Error("Failed to list devices", "error", err)
-		reconcileErrors.Inc()
-		return
+		return nil, err
 	}
 
+	var pending []PendingDevice
 	for _, device := range devices {
-		devicesProcessed.Inc()
-
 		if !device.Authorized {
 			continue
 		}
@@ -217,26 +205,13 @@ func reconcile(ctx context.Context, client DevicesClient, tagsToApply []string) 
 			continue
 		}
 
-		_, err := withRetry(ctx, func() (struct{}, error) {
-			return struct{}{}, client.SetTags(ctx, device.ID, tagsToApply)
+		pending = append(pending, PendingDevice{
+			ID:   device.ID,
+			Name: device.Name,
 		})
-		if err != nil {
-			slog.Error("Failed to set tags",
-				"device", device.Name,
-				"deviceID", device.ID,
-				"error", err,
-			)
-			reconcileErrors.Inc()
-			continue
-		}
-
-		tagsApplied.Inc()
-		slog.Info("Applied tags to device",
-			"device", device.Name,
-			"deviceID", device.ID,
-			"tags", tagsToApply,
-		)
 	}
+
+	return pending, nil
 }
 
 func withRetry[T any](ctx context.Context, fn func() (T, error)) (T, error) {
