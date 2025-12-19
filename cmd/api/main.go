@@ -123,12 +123,17 @@ func main() {
 	defer cancel()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+
+	// GET /healthz - Health check endpoint for Kubernetes probes.
+	// Returns 200 OK if the server is running.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
 
-	// Get pending devices
+	// GET /pending-devices - Returns a list of Tailscale devices that are
+	// authorized but have no tags assigned.
+	// Response: {"pending_devices": [{"id": "...", "name": "..."}]}
 	mux.HandleFunc("GET /pending-devices", func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("Getting pending devices")
 		pending, err := getPendingDevices(r.Context(), client)
@@ -142,7 +147,8 @@ func main() {
 		json.NewEncoder(w).Encode(PendingDevicesResponse{PendingDevices: pending})
 	})
 
-	// Approve a device
+	// POST /approve/{deviceID} - Approves a device by applying the configured tags.
+	// Returns 200 OK on success, 500 on failure.
 	mux.HandleFunc("POST /approve/{deviceID}", func(w http.ResponseWriter, r *http.Request) {
 		deviceID := r.PathValue("deviceID")
 		slog.Info("Approve requested", "deviceID", deviceID)
@@ -160,7 +166,8 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	// Decline a device
+	// POST /decline/{deviceID} - Declines a device. Currently only logs the action.
+	// Returns 200 OK.
 	mux.HandleFunc("POST /decline/{deviceID}", func(w http.ResponseWriter, r *http.Request) {
 		deviceID := r.PathValue("deviceID")
 		slog.Info("Device declined", "deviceID", deviceID)
@@ -225,14 +232,11 @@ func withRetry[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 			return result, nil
 		}
 
-		// Check for rate limit (429)
-		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit") {
-			slog.Warn("Rate limited, waiting before retry", "attempt", i+1, "backoff", backoff)
-		} else if i == maxRetries-1 {
+		if i == maxRetries-1 {
 			return zero, err
-		} else {
-			slog.Warn("Request failed, retrying", "attempt", i+1, "backoff", backoff, "error", err)
 		}
+
+		slog.Warn("Request failed, retrying", "attempt", i+1, "backoff", backoff, "error", err)
 
 		select {
 		case <-ctx.Done():
