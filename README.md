@@ -64,6 +64,7 @@
 | `DISCORD_GUILD_ID` | No | サーバーID |
 | `API_URL` | No | APIサーバーのURL（デフォルト: `http://localhost:8080`） |
 | `POLL_INTERVAL` | No | チェック間隔（デフォルト: `24h`） |
+| `MENTION_USER_IDS` | No | 自動通知時にメンションするユーザーID（カンマ区切り） |
 
 #### 必要なBot権限
 
