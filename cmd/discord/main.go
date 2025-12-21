@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ type Config struct {
 	BotToken     string
 	APIURL       string
 	ChannelID    string
+	GuildID      string
 	PollInterval time.Duration
 }
 
@@ -29,6 +31,14 @@ type PendingDevice struct {
 
 type PendingDevicesResponse struct {
 	PendingDevices []PendingDevice `json:"pending_devices"`
+}
+
+type TagsResponse struct {
+	Tags []string `json:"tags"`
+}
+
+type ApproveRequest struct {
+	Tags []string `json:"tags"`
 }
 
 func loadConfig() (Config, error) {
@@ -47,6 +57,8 @@ func loadConfig() (Config, error) {
 		return Config{}, errors.New("DISCORD_CHANNEL_ID is required")
 	}
 
+	guildID := os.Getenv("DISCORD_GUILD_ID") // optional: empty = global command
+
 	pollInterval := 24 * time.Hour
 	if pollIntervalStr := os.Getenv("POLL_INTERVAL"); pollIntervalStr != "" {
 		parsed, err := time.ParseDuration(pollIntervalStr)
@@ -60,6 +72,7 @@ func loadConfig() (Config, error) {
 		BotToken:     botToken,
 		APIURL:       apiURL,
 		ChannelID:    channelID,
+		GuildID:      guildID,
 		PollInterval: pollInterval,
 	}, nil
 }
@@ -91,12 +104,12 @@ func main() {
 		Description: "Check and approve pending Tailscale devices",
 	}
 
-	registeredCmd, err := dg.ApplicationCommandCreate(dg.State.User.ID, "", cmd)
+	registeredCmd, err := dg.ApplicationCommandCreate(dg.State.User.ID, cfg.GuildID, cmd)
 	if err != nil {
 		slog.Error("Failed to register slash command", "error", err)
 		os.Exit(1)
 	}
-	slog.Info("Registered slash command", "name", registeredCmd.Name)
+	slog.Info("Registered slash command", "name", registeredCmd.Name, "guildID", cfg.GuildID)
 
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 
@@ -113,13 +126,18 @@ func main() {
 		handleSlashCommand(s, i, cfg, httpClient)
 	})
 
-	// Handle button interactions
+	// Handle button and select menu interactions
 	dg.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.Type != discordgo.InteractionMessageComponent {
 			return
 		}
 
-		handleButtonClick(s, i, cfg, httpClient)
+		customID := i.MessageComponentData().CustomID
+		if strings.HasPrefix(customID, "select_tags:") {
+			handleSelectMenu(s, i, cfg, httpClient)
+		} else {
+			handleButtonClick(s, i, cfg, httpClient)
+		}
 	})
 
 	slog.Info("Discord bot started", "apiURL", cfg.APIURL, "pollInterval", cfg.PollInterval)
@@ -182,6 +200,25 @@ func fetchPendingDevices(cfg Config, httpClient *http.Client) ([]PendingDevice, 
 	}
 
 	return res.PendingDevices, nil
+}
+
+func fetchAvailableTags(cfg Config, httpClient *http.Client) ([]string, error) {
+	resp, err := httpClient.Get(cfg.APIURL + "/tags")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("controller returned status %d", resp.StatusCode)
+	}
+
+	var res TagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+
+	return res.Tags, nil
 }
 
 func handleSlashCommand(s *discordgo.Session, i *discordgo.InteractionCreate, cfg Config, httpClient *http.Client) {
@@ -264,52 +301,143 @@ func handleButtonClick(s *discordgo.Session, i *discordgo.InteractionCreate, cfg
 
 	slog.Info("Button clicked", "action", action, "deviceID", deviceID, "user", i.Member.User.Username)
 
-	// Acknowledge immediately
+	switch action {
+	case "approve":
+		// Fetch available tags and show select menu
+		tags, err := fetchAvailableTags(cfg, httpClient)
+		if err != nil {
+			slog.Error("Failed to fetch tags", "error", err)
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Failed to fetch available tags: " + err.Error(),
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			})
+			return
+		}
+
+		// Build select menu options
+		options := make([]discordgo.SelectMenuOption, len(tags))
+		for idx, tag := range tags {
+			options[idx] = discordgo.SelectMenuOption{
+				Label: tag,
+				Value: tag,
+			}
+		}
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("**Select tags to apply**\nDevice ID: `%s`", deviceID),
+				Components: []discordgo.MessageComponent{
+					discordgo.ActionsRow{
+						Components: []discordgo.MessageComponent{
+							discordgo.SelectMenu{
+								CustomID:    "select_tags:" + deviceID,
+								Placeholder: "Select tags to apply...",
+								MinValues:   intPtr(1),
+								MaxValues:   len(options),
+								Options:     options,
+							},
+						},
+					},
+					discordgo.ActionsRow{
+						Components: []discordgo.MessageComponent{
+							discordgo.Button{
+								Label:    "Cancel",
+								Style:    discordgo.SecondaryButton,
+								CustomID: "cancel:" + deviceID,
+							},
+						},
+					},
+				},
+			},
+		})
+
+	case "decline":
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredMessageUpdate,
+		})
+
+		resp, err := httpClient.Post(cfg.APIURL+"/decline/"+deviceID, "application/json", nil)
+		if err != nil {
+			slog.Error("Failed to call controller", "error", err)
+			s.ChannelMessageSend(i.ChannelID, fmt.Sprintf("Failed to decline device: %s", err.Error()))
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			slog.Error("Controller returned error", "status", resp.StatusCode)
+			s.ChannelMessageSend(i.ChannelID, fmt.Sprintf("Failed to decline device: %s", resp.Status))
+			return
+		}
+
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content:    ptr(fmt.Sprintf("❌ **Declined** by %s", i.Member.User.Username)),
+			Components: &[]discordgo.MessageComponent{},
+		})
+
+	case "cancel":
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseUpdateMessage,
+			Data: &discordgo.InteractionResponseData{
+				Content:    "🚫 **Cancelled**",
+				Components: []discordgo.MessageComponent{},
+			},
+		})
+	}
+}
+
+func handleSelectMenu(s *discordgo.Session, i *discordgo.InteractionCreate, cfg Config, httpClient *http.Client) {
+	customID := i.MessageComponentData().CustomID
+	parts := strings.SplitN(customID, ":", 2)
+	if len(parts) != 2 || parts[0] != "select_tags" {
+		return
+	}
+
+	deviceID := parts[1]
+	selectedTags := i.MessageComponentData().Values
+
+	slog.Info("Tags selected", "deviceID", deviceID, "tags", selectedTags, "user", i.Member.User.Username)
+
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredMessageUpdate,
 	})
 
-	var endpoint string
-	switch action {
-	case "approve":
-		endpoint = cfg.APIURL + "/approve/" + deviceID
-	case "decline":
-		endpoint = cfg.APIURL + "/decline/" + deviceID
-	default:
-		return
-	}
-
-	resp, err := httpClient.Post(endpoint, "application/json", nil)
+	// Call approve API with selected tags
+	reqBody, _ := json.Marshal(ApproveRequest{Tags: selectedTags})
+	resp, err := httpClient.Post(cfg.APIURL+"/approve/"+deviceID, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		slog.Error("Failed to call controller", "error", err)
-		s.ChannelMessageSend(i.ChannelID, fmt.Sprintf("Failed to %s device: %s", action, err.Error()))
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content:    ptr(fmt.Sprintf("Failed to approve device: %s", err.Error())),
+			Components: &[]discordgo.MessageComponent{},
+		})
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("Controller returned error", "status", resp.StatusCode)
-		s.ChannelMessageSend(i.ChannelID, fmt.Sprintf("Failed to %s device: %s", action, resp.Status))
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content:    ptr(fmt.Sprintf("Failed to approve device: %s", resp.Status)),
+			Components: &[]discordgo.MessageComponent{},
+		})
 		return
 	}
 
-	// Update original message
-	var resultEmoji string
-	var resultText string
-	if action == "approve" {
-		resultEmoji = "✅"
-		resultText = "Approved"
-	} else {
-		resultEmoji = "❌"
-		resultText = "Declined"
-	}
-
 	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content:    ptr(fmt.Sprintf("%s **%s** by %s", resultEmoji, resultText, i.Member.User.Username)),
+		Content:    ptr(fmt.Sprintf("✅ **Approved** by %s\nTags: `%s`", i.Member.User.Username, strings.Join(selectedTags, "`, `"))),
 		Components: &[]discordgo.MessageComponent{},
 	})
 }
 
 func ptr(s string) *string {
 	return &s
+}
+
+func intPtr(i int) *int {
+	return &i
 }
