@@ -1,6 +1,6 @@
 # tailscale-approval-bot
 
-タグが付いていないTailscaleデバイスをDiscordで通知し、ボタンひとつで承認できるBot。
+タグが付いていないTailscaleデバイスをDiscordで通知し、タグを選択して承認できるBot。
 
 ## アーキテクチャ
 
@@ -9,8 +9,10 @@
 │         api         │                      │    discord-bot      │
 │                     │ ← /pending-devices ─ │                     │
 │ GET pending devices │                      │ /tailscale-approve  │
-│                     │ ←── /approve/{id} ── │                     │
-│ Apply tags          │                      │ [Approve] [Decline] │
+│                     │ ←──── /tags ──────── │                     │
+│ GET available tags  │                      │ [Approve] [Decline] │
+│                     │ ←── /approve/{id} ── │        ↓            │
+│ Apply tags          │                      │ [Select tags...]    │
 └─────────────────────┘                      └─────────────────────┘
 ```
 
@@ -20,8 +22,10 @@
 2. タグなしデバイスが見つかったらDiscordに通知
    - 1-2台: Approve/Declineボタン付きメッセージ
    - 3台以上: Tailscale管理コンソールを確認するよう警告
-3. ユーザーがApprove/Declineをクリック
-4. BotがAPIを呼び出してタグを適用（またはDeclineをログ出力）
+3. ユーザーがApproveをクリック
+4. Tailscale ACLから取得したタグ一覧がドロップダウンで表示される
+5. ユーザーがタグを選択（複数選択可）
+6. BotがAPIを呼び出して選択したタグを適用
 
 ## コンポーネント
 
@@ -29,10 +33,17 @@
 
 | 環境変数 | 必須 | 説明 |
 |---------|------|------|
-| `TAILSCALE_TAILNET` | Yes | tailnet名 |
+| `TAILSCALE_TAILNET` | Yes | Tailnet ID |
 | `TAILSCALE_API_KEY` | Yes | Tailscale APIキー |
-| `TAGS_TO_APPLY` | Yes | 適用するタグ（カンマ区切り、例: `tag:a,tag:b`） |
 | `HTTP_PORT` | No | HTTPサーバーのポート（デフォルト: `8080`） |
+
+#### 必要なAPIキー権限
+
+| スコープ | 用途 |
+|---------|------|
+| `devices:read` | デバイス一覧の取得 |
+| `devices:write` | デバイスへのタグ適用 |
+| `policy_file:read` | ACLからタグ一覧の取得 |
 
 #### エンドポイント
 
@@ -40,7 +51,8 @@
 |-----|---------|------|
 | `/healthz` | GET | ヘルスチェック |
 | `/pending-devices` | GET | タグなしデバイス一覧を取得 |
-| `/approve/{deviceID}` | POST | デバイスにタグを適用 |
+| `/tags` | GET | 利用可能なタグ一覧を取得（ACLの`tagOwners`から） |
+| `/approve/{deviceID}` | POST | デバイスに指定タグを適用（body: `{"tags": ["tag:a"]}`) |
 | `/decline/{deviceID}` | POST | デバイスを拒否（ログ出力のみ） |
 
 ### Discord Bot
@@ -49,18 +61,17 @@
 |---------|------|------|
 | `DISCORD_BOT_TOKEN` | Yes | Discord Botトークン |
 | `DISCORD_CHANNEL_ID` | Yes | 通知を送るチャンネルID |
+| `DISCORD_GUILD_ID` | No | サーバーID |
 | `API_URL` | No | APIサーバーのURL（デフォルト: `http://localhost:8080`） |
 | `POLL_INTERVAL` | No | チェック間隔（デフォルト: `24h`） |
 
-## Dockerイメージ
+#### 必要なBot権限
 
-```bash
-# API
-docker build --target api -t api .
+- View Channels
+- Send Messages
+- Read Message History
 
-# Discord Bot
-docker build --target discord -t discord .
-```
+OAuth2スコープ: `bot`, `applications.commands`
 
 ## ライセンス
 
