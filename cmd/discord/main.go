@@ -17,11 +17,12 @@ import (
 )
 
 type Config struct {
-	BotToken     string
-	APIURL       string
-	ChannelID    string
-	GuildID      string
-	PollInterval time.Duration
+	BotToken       string
+	APIURL         string
+	ChannelID      string
+	GuildID        string
+	PollInterval   time.Duration
+	MentionUserIDs []string
 }
 
 type PendingDevice struct {
@@ -59,6 +60,15 @@ func loadConfig() (Config, error) {
 
 	guildID := os.Getenv("DISCORD_GUILD_ID") // optional: empty = global command
 
+	var mentionUserIDs []string
+	if mentionUserIDsStr := os.Getenv("MENTION_USER_IDS"); mentionUserIDsStr != "" {
+		for _, id := range strings.Split(mentionUserIDsStr, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				mentionUserIDs = append(mentionUserIDs, trimmed)
+			}
+		}
+	}
+
 	pollInterval := 24 * time.Hour
 	if pollIntervalStr := os.Getenv("POLL_INTERVAL"); pollIntervalStr != "" {
 		parsed, err := time.ParseDuration(pollIntervalStr)
@@ -69,11 +79,12 @@ func loadConfig() (Config, error) {
 	}
 
 	return Config{
-		BotToken:     botToken,
-		APIURL:       apiURL,
-		ChannelID:    channelID,
-		GuildID:      guildID,
-		PollInterval: pollInterval,
+		BotToken:       botToken,
+		APIURL:         apiURL,
+		ChannelID:      channelID,
+		GuildID:        guildID,
+		PollInterval:   pollInterval,
+		MentionUserIDs: mentionUserIDs,
 	}, nil
 }
 
@@ -159,6 +170,17 @@ func main() {
 	slog.Info("Shutting down")
 }
 
+func buildMentionString(userIDs []string) string {
+	if len(userIDs) == 0 {
+		return ""
+	}
+	var mentions []string
+	for _, id := range userIDs {
+		mentions = append(mentions, fmt.Sprintf("<@%s>", id))
+	}
+	return strings.Join(mentions, " ") + "\n"
+}
+
 func runScheduledCheck(s *discordgo.Session, cfg Config, httpClient *http.Client) {
 	slog.Info("Running scheduled check")
 
@@ -173,13 +195,15 @@ func runScheduledCheck(s *discordgo.Session, cfg Config, httpClient *http.Client
 		return
 	}
 
+	mentionPrefix := buildMentionString(cfg.MentionUserIDs)
+
 	if len(pending) >= 3 {
-		s.ChannelMessageSend(cfg.ChannelID, fmt.Sprintf("Warning: %d pending devices found. This is unusual. Please check the Tailscale admin console.", len(pending)))
+		s.ChannelMessageSend(cfg.ChannelID, fmt.Sprintf("%sWarning: %d pending devices found. This is unusual. Please check the Tailscale admin console.", mentionPrefix, len(pending)))
 		return
 	}
 
 	for _, device := range pending {
-		sendDeviceApprovalMessage(s, cfg.ChannelID, device)
+		sendDeviceApprovalMessageWithMention(s, cfg.ChannelID, device, mentionPrefix)
 	}
 }
 
@@ -265,8 +289,12 @@ func handleSlashCommand(s *discordgo.Session, i *discordgo.InteractionCreate, cf
 }
 
 func sendDeviceApprovalMessage(s *discordgo.Session, channelID string, device PendingDevice) {
+	sendDeviceApprovalMessageWithMention(s, channelID, device, "")
+}
+
+func sendDeviceApprovalMessageWithMention(s *discordgo.Session, channelID string, device PendingDevice, mentionPrefix string) {
 	_, err := s.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
-		Content: fmt.Sprintf("**New device pending approval**\nName: `%s`\nID: `%s`", device.Name, device.ID),
+		Content: fmt.Sprintf("%s**New device pending approval**\nName: `%s`\nID: `%s`", mentionPrefix, device.Name, device.ID),
 		Components: []discordgo.MessageComponent{
 			discordgo.ActionsRow{
 				Components: []discordgo.MessageComponent{
