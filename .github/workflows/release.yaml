@@ -36,7 +36,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.target }}
           tags: |
             type=sha,prefix=sha-,suffix=,format=short
-            type=schedule,pattern={{date 'YYYYMMDD'}}
+            # seichi_infra のマニフェストは latest@sha256:... で参照し、Renovate が digest の変化を追従する
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
         uses: docker/build-push-action@v7
