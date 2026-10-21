@@ -16,7 +16,8 @@ jobs:
       # latest を付けるかの判定で run の一覧を読む
       actions: read
     # 連続マージや古い run の再実行で run が並走し、古いコミットのビルドが後から完了しないよう
-    # 順に待たせる (cancel すると途中コミットの sha タグが push されなくなる)
+    # 直列化する。実行中の run はキャンセルしない (待機できる run はグループに 1 つだけで、
+    # さらに新しい run が来ると待機中の方は cancel される)
     concurrency:
       group: ${{ github.workflow }}-${{ matrix.target }}
       cancel-in-progress: false
@@ -51,13 +52,11 @@ jobs:
             workflow_file=${GITHUB_WORKFLOW_REF%@*}
             workflow_file=${workflow_file##*/}
             if ! newest_sha=$(gh run list -R "${GITHUB_REPOSITORY}" --workflow "${workflow_file}" \
-                --branch "${DEFAULT_BRANCH}" --event push --limit 1 --json headSha --jq '.[0].headSha'); then
-              # API が失敗しても sha タグのビルドは止めない。初回実行なら latest を付け、
-              # 巻き戻りうる再実行では付けない
-              echo "::warning::最新の run を取得できなかった (run_attempt=${GITHUB_RUN_ATTEMPT})"
-              if [ "${GITHUB_RUN_ATTEMPT}" = 1 ]; then
-                enable=true
-              fi
+                --branch "${DEFAULT_BRANCH}" --event push --limit 1 --json headSha --jq '.[0].headSha // ""') \
+                || [ -z "${newest_sha}" ]; then
+              # 判定できないときは巻き戻りを避けて latest を付けない (sha タグのビルドは止めない)。
+              # latest は次の push で進む
+              echo "::warning::この workflow の最新の run を取得できなかったため latest を付けない"
             elif [ "${newest_sha}" = "${GITHUB_SHA}" ]; then
               enable=true
             else
